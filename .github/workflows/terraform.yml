@@ -1,0 +1,125 @@
+name: 'Terraform Deploy'
+
+on:
+  push:
+    branches: [ master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ master ]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VAR_project_slug: ${{ vars.PROJECT_SLUG }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Docker image
+      run: docker build -t lambda-builder .
+
+    - name: Extract Lambda package
+      run: |
+        docker create --name temp lambda-builder
+        docker cp temp:/build/lambda_package.zip .
+        docker rm temp
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: lambda-package
+        path: lambda_package.zip
+
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: lambda_package.zip
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  terraform:
+    name: 'Terraform'
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set Terraform Environment Variables
+      run: |
+        echo "TF_VAR_project_slug=${{ github.event.repository.name }}" >> $GITHUB_ENV
+        echo "TF_VAR_aws_region=${{ vars.AWS_REGION }}" >> $GITHUB_ENV
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ vars.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: "1.7.0"
+
+    - name: Setup Backend
+      working-directory: backend
+      run: |
+        BUCKET_NAME=${AWS_REGION}-$(echo ${TF_VAR_project_slug} | tr '_' '-')-terraform-state
+        TABLE_NAME=${AWS_REGION}-$(echo ${TF_VAR_project_slug} | tr '_' '-')-terraform-lock
+        terraform init -backend=false
+        if aws s3api head-bucket --bucket "${BUCKET_NAME}" 2>/dev/null; then
+          terraform import "aws_s3_bucket.terraform_state" "${BUCKET_NAME}"
+        else
+          echo "backend S3 bucket does not exist"
+        fi
+        if aws dynamodb describe-table --table-name "${TABLE_NAME}" 2>/dev/null; then
+          terraform import "aws_dynamodb_table.terraform_state_lock" "${TABLE_NAME}"
+        else
+          echo "backend DynamoDB table does not exist"
+        fi
+        terraform apply -auto-approve
+        echo "TF_BACKEND_BUCKET=${BUCKET_NAME}" >> $GITHUB_ENV
+        echo "TF_BACKEND_DYNAMODB=${TABLE_NAME}" >> $GITHUB_ENV
+
+    - name: Download Lambda package
+      uses: actions/download-artifact@v4
+      with:
+        name: lambda-package
+
+    - name: Prepare Lambda package
+      run: |
+        mv lambda_package.zip "${TF_VAR_project_slug}_lambda.zip"
+
+    - name: Terraform Format
+      run: terraform fmt -check
+
+    - name: Terraform Init Main
+      run: |
+        terraform init \
+          -backend-config="bucket=${TF_BACKEND_BUCKET}" \
+          -backend-config="dynamodb_table=${TF_BACKEND_DYNAMODB}" \
+          -backend-config="region=${AWS_REGION}" \
+          -backend-config="key=${TF_VAR_project_slug}.tfstate"
+
+    - name: Terraform Plan
+      if: github.event_name == 'pull_request'
+      run: terraform plan -no-color
+      continue-on-error: true
+
+    - name: Terraform Apply
+      if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+      run: terraform apply -auto-approve
